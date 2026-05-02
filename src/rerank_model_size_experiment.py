@@ -104,6 +104,7 @@ def main() -> None:
   parser.add_argument("--api-base-url", default=os.getenv("SILICONFLOW_RERANK_URL") or os.getenv("RERANK_API_BASE_URL") or "")
   parser.add_argument("--api-timeout", type=int, default=120)
   parser.add_argument("--rerank-instruction", default=DEFAULT_QWEN3_RERANK_INSTRUCTION)
+  parser.add_argument("--seed", type=int, default=20260503, help="固定 Step 3/Step 4 随机分批顺序，便于模型横评。")
   parser.add_argument("--skip-existing", action="store_true")
   parser.add_argument("--fail-fast", action="store_true", help="某个模型失败时立即退出；默认记录失败并继续。")
   args = parser.parse_args()
@@ -161,6 +162,8 @@ def main() -> None:
           timeout=args.api_timeout,
           instruction=args.rerank_instruction,
         )
+        if hasattr(rank_mod, "random"):
+          rank_mod.random.seed(args.seed)
         rank_mod.process_file(
           reranker=reranker,
           input_path=str(input_path),
@@ -178,6 +181,8 @@ def main() -> None:
       if args.skip_existing and llm_path.exists():
         log(f"[size-experiment] reuse llm: {llm_path}")
       else:
+        if hasattr(llm_mod, "random"):
+          llm_mod.random.seed(args.seed)
         llm_mod.process_file(
           input_path=str(rerank_path),
           output_path=str(llm_path),

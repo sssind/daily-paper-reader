@@ -138,6 +138,7 @@ def main() -> None:
   parser.add_argument("--rerank-model", default=os.getenv("LOCAL_RERANK_MODEL") or "Qwen/Qwen3-Reranker-0.6B")
   parser.add_argument("--rerank-device", default=os.getenv("LOCAL_RERANK_DEVICE", "cpu"))
   parser.add_argument("--rerank-batch-size", type=int, default=int(os.getenv("LOCAL_RERANK_BATCH_SIZE") or "4"))
+  parser.add_argument("--seed", type=int, default=20260503, help="固定 Step 3/Step 4 随机分批顺序，便于预算/模型对比。")
   parser.add_argument("--skip-existing", action="store_true")
   args = parser.parse_args()
 
@@ -194,6 +195,8 @@ def main() -> None:
     if args.skip_existing and rerank_path.exists():
       log(f"[experiment] reuse rerank: {rerank_path}")
     else:
+      if hasattr(rank_mod, "random"):
+        rank_mod.random.seed(args.seed)
       rank_mod.process_file(
         reranker=reranker,
         input_path=str(input_path),
@@ -210,6 +213,8 @@ def main() -> None:
     if args.skip_existing and llm_path.exists():
       log(f"[experiment] reuse llm: {llm_path}")
     else:
+      if hasattr(llm_mod, "random"):
+        llm_mod.random.seed(args.seed)
       llm_mod.process_file(
         input_path=str(rerank_path),
         output_path=str(llm_path),
