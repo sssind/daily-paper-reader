@@ -16,6 +16,11 @@ SILICONFLOW_QWEN3_RERANKER_MODELS = [
   "Qwen/Qwen3-Reranker-4B",
   "Qwen/Qwen3-Reranker-8B",
 ]
+SILICONFLOW_CHUNK_OPTION_MODELS = {
+  "BAAI/bge-reranker-v2-m3",
+  "Pro/BAAI/bge-reranker-v2-m3",
+  "netease-youdao/bce-reranker-base_v1",
+}
 SILICONFLOW_QWEN3_PRICE_PER_M_TOKEN = {
   "Qwen/Qwen3-Reranker-0.6B": 0.01,
   "Qwen/Qwen3-Reranker-4B": 0.02,
@@ -44,6 +49,10 @@ def _extract_tokens(payload: Dict[str, Any]) -> Dict[str, int]:
   tokens: Dict[str, Any] = {}
   if isinstance(payload.get("tokens"), dict):
     tokens = payload.get("tokens") or {}
+  elif isinstance(payload.get("meta"), dict):
+    meta = payload.get("meta") or {}
+    if isinstance(meta.get("tokens"), dict):
+      tokens = meta.get("tokens") or {}
   elif isinstance(payload.get("meta"), list):
     for item in payload.get("meta") or []:
       if isinstance(item, dict) and isinstance(item.get("tokens"), dict):
@@ -73,6 +82,8 @@ class SiliconFlowReranker:
     timeout: int = 120,
     instruction: Optional[str] = DEFAULT_QWEN3_RERANK_INSTRUCTION,
     return_documents: bool = False,
+    max_chunks_per_doc: Optional[int] = None,
+    overlap_tokens: Optional[int] = None,
     session: Optional[requests.Session] = None,
   ) -> None:
     self.api_key = (
@@ -93,6 +104,8 @@ class SiliconFlowReranker:
     self.timeout = max(int(timeout or 1), 1)
     self.instruction = str(instruction or "").strip()
     self.return_documents = bool(return_documents)
+    self.max_chunks_per_doc = max_chunks_per_doc
+    self.overlap_tokens = overlap_tokens
     self.session = session or requests.Session()
     self.call_count = 0
     self.total_latency_seconds = 0.0
@@ -122,9 +135,19 @@ class SiliconFlowReranker:
       "return_documents": self.return_documents,
     }
     if top_n is not None:
-      payload["top_n"] = max(int(top_n), 0)
-    if self.instruction:
+      payload["top_n"] = max(int(top_n), 1)
+    if self.instruction and self._supports_instruction(payload["model"]):
       payload["instruction"] = self.instruction
+    if (
+      self.max_chunks_per_doc is not None
+      and self._supports_chunk_options(payload["model"])
+    ):
+      payload["max_chunks_per_doc"] = max(int(self.max_chunks_per_doc), 1)
+    if (
+      self.overlap_tokens is not None
+      and self._supports_chunk_options(payload["model"])
+    ):
+      payload["overlap_tokens"] = min(max(int(self.overlap_tokens), 0), 80)
 
     started = time.perf_counter()
     response = self.session.post(
@@ -159,6 +182,14 @@ class SiliconFlowReranker:
     self.input_tokens += token_usage["input_tokens"]
     self.output_tokens += token_usage["output_tokens"]
     return data
+
+  @staticmethod
+  def _supports_instruction(model: str) -> bool:
+    return str(model or "").strip() in SILICONFLOW_QWEN3_RERANKER_MODELS
+
+  @staticmethod
+  def _supports_chunk_options(model: str) -> bool:
+    return str(model or "").strip() in SILICONFLOW_CHUNK_OPTION_MODELS
 
   def stats(self, model: str = "") -> Dict[str, Any]:
     price = SILICONFLOW_QWEN3_PRICE_PER_M_TOKEN.get(str(model or ""))

@@ -27,7 +27,10 @@ class FakeResponse:
                 {"index": 1, "relevance_score": 0.9},
                 {"index": 0, "relevance_score": 0.2},
             ],
-            "tokens": {"input_tokens": 123, "output_tokens": 4},
+            "meta": {
+                "tokens": {"input_tokens": 123, "output_tokens": 4},
+                "billed_units": {"input_tokens": 123, "output_tokens": 4},
+            },
         }
 
 
@@ -92,6 +95,30 @@ class RerankerApiTest(unittest.TestCase):
         self.assertEqual(stats["output_tokens"], 4)
         self.assertEqual(stats["price_per_m_token_usd"], 0.04)
         self.assertGreaterEqual(stats["estimated_cost_usd"], 0)
+
+    def test_siliconflow_reranker_handles_classic_model_options(self):
+        session = FakeSession()
+        reranker = self.api_mod.SiliconFlowReranker(
+            api_key="test-key",
+            base_url="https://example.test/v1/rerank",
+            instruction="academic relevance",
+            max_chunks_per_doc=0,
+            overlap_tokens=120,
+            session=session,
+        )
+
+        reranker.rerank(
+            query="graph neural networks",
+            documents=["doc a", "doc b"],
+            top_n=0,
+            model="BAAI/bge-reranker-v2-m3",
+        )
+
+        call = session.calls[0]
+        self.assertEqual(call["json"]["top_n"], 1)
+        self.assertNotIn("instruction", call["json"])
+        self.assertEqual(call["json"]["max_chunks_per_doc"], 1)
+        self.assertEqual(call["json"]["overlap_tokens"], 80)
 
     def test_siliconflow_reranker_requires_key(self):
         with patch.dict("os.environ", {}, clear=True):
