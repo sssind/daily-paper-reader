@@ -7,13 +7,20 @@
     root.DPRLLMConfigUtils = api;
   }
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
-  const DEFAULT_PLATO_BASE_URL = 'https://api.bltcy.ai/v1';
-  const DEFAULT_PLATO_CHAT_MODELS = [
-    'gemini-3-flash-preview-thinking-1000',
-    'deepseek-v3.2',
-    'gpt-5-chat',
-    'gemini-3-pro-preview',
+  const DEFAULT_DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
+  const DEFAULT_DEEPSEEK_CHAT_MODELS = [
+    'deepseek-v4-flash',
+    'deepseek-v4-pro',
   ];
+  const DEEPSEEK_V4_MAX_OUTPUT_TOKENS = 393216;
+  const DEEPSEEK_PRESETS = Object.freeze({
+    deepseek: Object.freeze({
+      key: 'deepseek',
+      label: 'DeepSeek 官方',
+      baseUrl: 'https://api.deepseek.com',
+      models: Object.freeze(['deepseek-v4-flash', 'deepseek-v4-pro']),
+    }),
+  });
 
   const normalizeText = (value) => String(value || '').trim();
 
@@ -106,20 +113,93 @@
     const safeSecret = secret && typeof secret === 'object' ? secret : {};
     const llmProvider = safeSecret.llmProvider || {};
     const explicit = normalizeText(llmProvider.type || llmProvider.provider || '').toLowerCase();
-    if (explicit === 'plato' || explicit === 'openai-compatible') {
-      return explicit;
+    if (explicit === 'deepseek') {
+      return 'deepseek';
     }
-    const summary = resolveSummaryLLM(safeSecret);
-    if (!summary) return 'plato';
-    if (/bltcy\.ai|gptbest\.vip/i.test(summary.baseUrl)) {
-      return 'plato';
+    return 'deepseek';
+  };
+
+  const getDeepSeekPreset = (key) => {
+    const presetKey = normalizeText(key).toLowerCase();
+    const preset = DEEPSEEK_PRESETS[presetKey];
+    if (!preset) return null;
+    return {
+      key: preset.key,
+      label: preset.label,
+      baseUrl: preset.baseUrl,
+      models: [...preset.models],
+    };
+  };
+
+  const inferChatApiProfile = (baseUrl, model) => {
+    const normalizedBaseUrl = normalizeBaseUrlForStorage(baseUrl || '').toLowerCase();
+    const normalizedModel = normalizeText(model || '').toLowerCase();
+    if (/(^|\/\/)(api\.)?deepseek\.com(?:$|\/)/i.test(normalizedBaseUrl)) {
+      return 'deepseek';
     }
-    return 'openai-compatible';
+    if (normalizedModel.startsWith('deepseek-')) {
+      return 'deepseek';
+    }
+    return 'unsupported';
+  };
+
+  const resolveJsonResponseMode = ({ baseUrl, model, preferSchema = true }) => {
+    return 'json_object';
+  };
+
+  const isDeepSeekV4Model = (model) => {
+    const normalizedModel = normalizeText(model || '').toLowerCase();
+    return normalizedModel === 'deepseek-v4-flash' || normalizedModel === 'deepseek-v4-pro';
+  };
+
+  const resolveMaxOutputTokens = ({ baseUrl, model } = {}) => {
+    const profile = inferChatApiProfile(baseUrl, model);
+    if (profile === 'deepseek' && isDeepSeekV4Model(model)) {
+      return DEEPSEEK_V4_MAX_OUTPUT_TOKENS;
+    }
+    return null;
+  };
+
+  const shouldUseXApiKeyHeader = ({ baseUrl, model }) => {
+    return true;
+  };
+
+  const buildStreamingChatPayload = ({ baseUrl, model, messages }) => {
+    const payload = {
+      model: normalizeText(model),
+      messages: Array.isArray(messages) ? messages : [],
+      stream: true,
+    };
+    const maxTokens = resolveMaxOutputTokens({ baseUrl, model });
+    if (maxTokens) {
+      payload.max_tokens = maxTokens;
+    }
+    return payload;
+  };
+
+  const buildConnectivityTestPayload = ({ baseUrl, model }) => {
+    const normalizedModel = normalizeText(model);
+    return {
+      model: normalizedModel,
+      messages: [
+        {
+          role: 'system',
+          content: 'Reply with exactly: hello world',
+        },
+        {
+          role: 'user',
+          content: 'hello world',
+        },
+      ],
+      temperature: 0,
+      max_tokens: 256,
+    };
   };
 
   return {
-    DEFAULT_PLATO_BASE_URL,
-    DEFAULT_PLATO_CHAT_MODELS,
+    DEFAULT_DEEPSEEK_BASE_URL,
+    DEFAULT_DEEPSEEK_CHAT_MODELS,
+    DEEPSEEK_PRESETS,
     normalizeText,
     normalizeBaseUrlForStorage,
     buildChatCompletionsEndpoint,
@@ -127,5 +207,13 @@
     resolveChatModels,
     resolveSummaryLLM,
     inferProviderType,
+    getDeepSeekPreset,
+    inferChatApiProfile,
+    resolveJsonResponseMode,
+    isDeepSeekV4Model,
+    resolveMaxOutputTokens,
+    shouldUseXApiKeyHeader,
+    buildStreamingChatPayload,
+    buildConnectivityTestPayload,
   };
 });

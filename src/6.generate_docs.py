@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Tuple
 
 import fitz  # PyMuPDF
 import requests
-from llm import BltClient
+from llm import DeepSeekClient
 
 SCRIPT_DIR = os.path.dirname(__file__)
 ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
@@ -26,26 +26,38 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 try:
-    from paper_figures import ensure_paper_figures
+    from paper_figures import ensure_paper_media
 except Exception:  # pragma: no cover
-    from src.paper_figures import ensure_paper_figures
+    from src.paper_figures import ensure_paper_media
 
 CONFIG_FILE = os.path.join(ROOT_DIR, "config.yaml")
 TODAY_STR = str(os.getenv("DPR_RUN_DATE") or "").strip() or datetime.now(timezone.utc).strftime("%Y%m%d")
 RANGE_DATE_RE = re.compile(r"^(\d{8})-(\d{8})$")
 
-# LLM 配置（使用 llm.py 内的 BLT 客户端）
-BLT_API_KEY = os.getenv("BLT_API_KEY")
-BLT_MODEL = os.getenv("BLT_SUMMARY_MODEL", "gemini-3-flash-preview")
-LLM_CLIENT = None
-if BLT_API_KEY:
-    LLM_CLIENT = BltClient(api_key=BLT_API_KEY, model=BLT_MODEL)
+# LLM 配置（使用 llm.py 内的 DeepSeek 客户端）
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY") or os.getenv("SUMMARY_API_KEY")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL") or os.getenv("SUMMARY_BASE_URL") or "https://api.deepseek.com"
+DEEPSEEK_MODEL = os.getenv("SUMMARY_MODEL") or os.getenv("DEEPSEEK_MODEL") or "deepseek-v4-flash"
+STEP6_STRUCTURED_MAX_TOKENS = 16 * 1024
+
+
+def create_llm_client() -> DeepSeekClient | None:
+    if not DEEPSEEK_API_KEY:
+        return None
+    return DeepSeekClient(
+        api_key=DEEPSEEK_API_KEY,
+        model=DEEPSEEK_MODEL,
+        base_url=DEEPSEEK_BASE_URL,
+    )
+
+
+LLM_CLIENT = create_llm_client()
 
 DEFAULT_DOCS_CONCURRENCY = 4
 
 
-def call_blt_text(
-    client: BltClient,
+def call_llm_text(
+    client: DeepSeekClient,
     messages: List[Dict[str, str]],
     temperature: float,
     max_tokens: int,
@@ -61,85 +73,40 @@ def call_blt_text(
     return (resp.get("content") or "").strip()
 
 
-def strip_json_wrappers(text: str) -> str:
-    cleaned = (text or "").strip()
-    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    return cleaned.strip()
-
-
-def repair_json_suffix(text: str) -> str:
-    if not text:
-        return text
-    stack: List[str] = []
-    in_str = False
-    escaped = False
-    for ch in text:
-        if in_str:
-            if escaped:
-                escaped = False
-                continue
-            if ch == "\\":
-                escaped = True
-                continue
-            if ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == '{':
-            stack.append("}")
-        elif ch == '[':
-            stack.append("]")
-        elif ch in ("}", "]"):
-            if stack and stack[-1] == ch:
-                stack.pop()
-    repaired = text
-    if in_str:
-        repaired += '"'
-    if stack:
-        repaired += "".join(reversed(stack))
-    repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
-    return repaired
-
-
-def parse_llm_json(content: str) -> Dict[str, Any] | list[Any] | None:
-    raw = strip_json_wrappers(content)
-    if not raw:
+def call_llm_structured_json(
+    client: DeepSeekClient,
+    messages: List[Dict[str, str]],
+    schema_name: str,
+    schema: Dict[str, Any],
+    temperature: float,
+    max_tokens: int,
+) -> Dict[str, Any] | None:
+    client.kwargs.update(
+        {
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
+        }
+    )
+    resp = client.chat_structured(
+        messages=messages,
+        schema_name=schema_name,
+        schema=schema,
+        strict=True,
+        allow_json_object_fallback=True,
+    )
+    if resp.get("refusal"):
+        log(f"[WARN] Structured output refusal: {resp.get('refusal')}")
         return None
-    candidates: List[str] = []
-    decoder = json.JSONDecoder()
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start != -1:
-        candidates.append(raw[start:])
-        if end != -1 and end > start:
-            candidates.append(raw[start : end + 1])
-    else:
-        candidates.append(raw)
-    seen = set()
-    last_exc: Exception | None = None
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        try:
-            obj, _idx = decoder.raw_decode(candidate)
-            if isinstance(obj, (dict, list)):
-                return obj
-        except Exception as exc:
-            last_exc = exc
-            repaired = repair_json_suffix(candidate)
-            if repaired != candidate:
-                try:
-                    obj = json.loads(repaired)
-                    if isinstance(obj, (dict, list)):
-                        return obj
-                except Exception as exc2:
-                    last_exc = exc2
-    if last_exc:
-        raise last_exc
-    return None
+    if resp.get("finish_reason") not in (None, "stop"):
+        log(f"[WARN] Structured output 未完成：finish_reason={resp.get('finish_reason')}")
+        return None
+    if resp.get("parse_error") is not None:
+        raise ValueError(f"模型未返回合法 JSON：{resp.get('content')}")
+
+    parsed = resp.get("parsed")
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
 
 
 def log(message: str) -> None:
@@ -322,8 +289,13 @@ def fetch_arxiv_paper_meta(arxiv_id: str) -> Dict[str, Any]:
     return parse_arxiv_xml_feed(resp.text)
 
 
-def translate_title_and_abstract_to_zh(title: str, abstract: str) -> Tuple[str, str]:
-    if LLM_CLIENT is None:
+def translate_title_and_abstract_to_zh(
+    title: str,
+    abstract: str,
+    client: DeepSeekClient | None = None,
+) -> Tuple[str, str]:
+    active_client = client or LLM_CLIENT
+    if active_client is None:
         return "", ""
     title = title.strip() if title else ""
     abstract = abstract.strip() if abstract else ""
@@ -358,27 +330,18 @@ def translate_title_and_abstract_to_zh(title: str, abstract: str) -> Tuple[str, 
             "required": ["title_zh", "abstract_zh"],
             "additionalProperties": False,
         }
-        use_json_object = "gemini" in (getattr(LLM_CLIENT, "model", "") or "").lower()
-        if use_json_object:
-            response_format = {"type": "json_object"}
-        else:
-            response_format = {
-                "type": "json_schema",
-                "json_schema": {"name": "translate_zh", "schema": schema, "strict": True},
-            }
-
-        content = call_blt_text(
-            LLM_CLIENT,
+        parsed = call_llm_structured_json(
+            active_client,
             messages,
+            schema_name="translate_zh",
+            schema=schema,
             temperature=0.2,
-            max_tokens=4000,
-            response_format=response_format,
+            max_tokens=STEP6_STRUCTURED_MAX_TOKENS,
         )
     except Exception:
         return "", ""
 
     try:
-        parsed = parse_llm_json(content)
         if not isinstance(parsed, dict):
             return "", ""
         obj = parsed
@@ -570,9 +533,15 @@ def upsert_glance_block_in_text(md_text: str, glance: str) -> str:
     return (txt.rstrip() + f"\n\n## 速览\n{glance}\n").rstrip() + "\n"
 
 
-def generate_deep_summary(md_file_path: str, txt_file_path: str, max_retries: int = 3) -> str | None:
-    if LLM_CLIENT is None:
-        log("[WARN] 未配置 BLT_API_KEY，跳过精读总结。")
+def generate_deep_summary(
+    md_file_path: str,
+    txt_file_path: str,
+    max_retries: int = 3,
+    client: DeepSeekClient | None = None,
+) -> str | None:
+    active_client = client or LLM_CLIENT
+    if active_client is None:
+        log("[WARN] 未配置 DEEPSEEK_API_KEY 或 SUMMARY_API_KEY，跳过精读总结。")
         return None
     if not os.path.exists(md_file_path):
         return None
@@ -612,7 +581,7 @@ def generate_deep_summary(md_file_path: str, txt_file_path: str, max_retries: in
     last = ""
     for attempt in range(1, max_retries + 1):
         try:
-            summary = call_blt_text(LLM_CLIENT, messages, temperature=0.3, max_tokens=4096)
+            summary = call_llm_text(active_client, messages, temperature=0.3, max_tokens=4096)
             summary = (summary or "").strip()
             if not summary:
                 continue
@@ -627,7 +596,7 @@ def generate_deep_summary(md_file_path: str, txt_file_path: str, max_retries: in
                 {"role": "user", "content": "你上一次的总结可能被截断了，请从中断处继续补全，不要重复已输出内容。"},
                 {"role": "user", "content": f"上一次输出如下：\n\n{summary}\n\n请继续补全，最后以一行“（完）”结束。"},
             ]
-            cont = call_blt_text(LLM_CLIENT, cont_messages, temperature=0.3, max_tokens=2048)
+            cont = call_llm_text(active_client, cont_messages, temperature=0.3, max_tokens=2048)
             cont = (cont or "").strip()
             merged = f"{summary}\n\n{cont}".strip()
             if os.getenv("DPR_DEBUG_STEP6") == "1":
@@ -640,24 +609,31 @@ def generate_deep_summary(md_file_path: str, txt_file_path: str, max_retries: in
     return last or None
 
 
-def generate_glance_overview(title: str, abstract: str, max_retries: int = 3) -> str | None:
+def generate_glance_overview(
+    title: str,
+    abstract: str,
+    max_retries: int = 3,
+    client: DeepSeekClient | None = None,
+) -> str | None:
     """
     生成论文速览（包含 TLDR、Motivation、Method、Result、Conclusion）。
     使用 JSON 结构化输出，确保返回完整的五个字段。
     """
-    if LLM_CLIENT is None:
+    active_client = client or LLM_CLIENT
+    if active_client is None:
         log("[WARN] 未配置 LLM_CLIENT，跳过速览生成。")
         return None
 
-    system_prompt = "你是论文速览助手，请用中文简洁地总结论文的关键信息。"
+    system_prompt = "你是论文速览助手，请用中文生成信息密度高、但不冗长的论文速览。"
     payload = {"title": title, "abstract": abstract}
     user_text = json.dumps(payload, ensure_ascii=False)
     user_prompt = (
         "请基于上面的 JSON 中的 title 和 abstract，输出一个中文速览摘要，严格返回 JSON（不要输出任何其它文字）：\n"
         "{\"tldr\":\"...\",\"motivation\":\"...\",\"method\":\"...\",\"result\":\"...\",\"conclusion\":\"...\"}\n"
         "要求：\n"
-        "- tldr：100字左右的完整概述，涵盖研究背景、方法和主要贡献\n"
-        "- motivation/method/result/conclusion：每个字段一句话概括，简洁明了\n"
+        "- tldr：150-220个中文字符，不是一句话口号；通常写成3-4个短句，按“问题背景→核心方法→关键结果→贡献意义”的顺序组织\n"
+        "- motivation/method/result/conclusion：每个字段30-70个中文字符，通常一句话；对标论文页速览卡片，简洁但必须包含具体信息\n"
+        "- 不要把英文句子放进中文字段；可保留必要英文术语或模型名\n"
         "Output must be strict JSON only, no markdown, no fences, no extra text."
     )
 
@@ -673,14 +649,6 @@ def generate_glance_overview(title: str, abstract: str, max_retries: int = 3) ->
         "required": ["tldr", "motivation", "method", "result", "conclusion"],
         "additionalProperties": False,
     }
-    use_json_object = "gemini" in (getattr(LLM_CLIENT, "model", "") or "").lower()
-    if use_json_object:
-        response_format = {"type": "json_object"}
-    else:
-        response_format = {
-            "type": "json_schema",
-            "json_schema": {"name": "glance_overview", "schema": schema, "strict": True},
-        }
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -690,14 +658,14 @@ def generate_glance_overview(title: str, abstract: str, max_retries: int = 3) ->
 
     for attempt in range(1, max_retries + 1):
         try:
-            content = call_blt_text(
-                LLM_CLIENT,
+            parsed = call_llm_structured_json(
+                active_client,
                 messages,
+                schema_name="glance_overview",
+                schema=schema,
                 temperature=0.2,
-                max_tokens=2048,
-                response_format=response_format,
+                max_tokens=STEP6_STRUCTURED_MAX_TOKENS,
             )
-            parsed = parse_llm_json(content)
             if not isinstance(parsed, dict):
                 continue
             obj = parsed
@@ -1014,7 +982,7 @@ def build_daily_brief_summary(
         "直接输出 1-3 行文本，不要 Markdown 标题，也不要 JSON。"
     )
     try:
-        content = call_blt_text(
+        content = call_llm_text(
             LLM_CLIENT,
             [
                 {"role": "system", "content": system_prompt},
@@ -1275,23 +1243,39 @@ def maybe_generate_paper_figures(
     paper_id: str,
     pdf_url: str,
 ) -> List[Dict[str, Any]]:
+    figures, _tables = maybe_generate_paper_media(
+        paper,
+        docs_dir=docs_dir,
+        paper_id=paper_id,
+        pdf_url=pdf_url,
+    )
+    return figures
+
+
+def maybe_generate_paper_media(
+    paper: Dict[str, Any],
+    *,
+    docs_dir: str,
+    paper_id: str,
+    pdf_url: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     source_key = str(paper.get("source") or "").strip().lower()
     if source_key not in {"arxiv", "biorxiv"}:
-        return []
+        return [], []
     if not str(pdf_url or "").strip():
-        return []
+        return [], []
 
     asset_key = str(paper.get("id") or paper_id.replace("/", "-")).strip()
     try:
-        return ensure_paper_figures(
+        return ensure_paper_media(
             pdf_url=pdf_url,
             docs_dir=docs_dir,
             source_key=source_key,
             asset_key=asset_key,
         )
     except Exception as e:
-        log(f"[WARN] 论文插图提取失败：{asset_key}: {e}")
-        return []
+        log(f"[WARN] 论文图表提取失败：{asset_key}: {e}")
+        return [], []
 
 
 def upsert_front_matter_field(md_text: str, key: str, value: str) -> Tuple[str, bool]:
@@ -1350,6 +1334,7 @@ def build_markdown_content(
     paper_source = str(paper.get("source") or "").strip()
     selection_source = str(paper.get("selection_source") or "").strip()
     figure_assets = paper.get("_figure_assets") if isinstance(paper.get("_figure_assets"), list) else []
+    table_assets = paper.get("_table_assets") if isinstance(paper.get("_table_assets"), list) else []
 
     # 解析速览内容
     glance = paper.get("_glance_overview", "").strip()
@@ -1401,6 +1386,8 @@ def build_markdown_content(
         lines.append(f"selection_source: {yaml_escape_value(selection_source)}")
     if figure_assets:
         lines.append(f"figures_json: {yaml_escape_value(json.dumps(figure_assets, ensure_ascii=False))}")
+    if table_assets:
+        lines.append(f"tables_json: {yaml_escape_value(json.dumps(table_assets, ensure_ascii=False))}")
 
     # 速览字段
     if glance_motivation:
@@ -1464,6 +1451,7 @@ def process_paper(
     md_path, txt_path, paper_id = prepare_paper_paths(docs_dir, date_str, title, arxiv_id)
     abstract_en = (paper.get("abstract") or "").strip()
     pdf_url = str(paper.get("link") or paper.get("pdf_url") or "").strip()
+    paper_llm_client = create_llm_client()
 
     glance = ""
 
@@ -1484,19 +1472,31 @@ def process_paper(
 
         existing_meta = _parse_front_matter(existing)
         has_figures_json = bool(str(existing_meta.get("figures_json") or "").strip()) if existing_meta else False
-        if not has_figures_json:
-            figures = maybe_generate_paper_figures(
+        has_tables_json = bool(str(existing_meta.get("tables_json") or "").strip()) if existing_meta else False
+        if not has_figures_json or not has_tables_json:
+            figures, tables = maybe_generate_paper_media(
                 paper,
                 docs_dir=docs_dir,
                 paper_id=paper_id,
                 pdf_url=pdf_url,
             )
-            if figures:
+            if figures and not has_figures_json:
                 paper["_figure_assets"] = figures
                 updated, changed = upsert_front_matter_field(
                     existing,
                     "figures_json",
                     yaml_escape_value(json.dumps(figures, ensure_ascii=False)),
+                )
+                if changed:
+                    with open(md_path, "w", encoding="utf-8") as f:
+                        f.write(updated + ("\n" if not updated.endswith("\n") else ""))
+                    existing = updated
+            if tables and not has_tables_json:
+                paper["_table_assets"] = tables
+                updated, changed = upsert_front_matter_field(
+                    existing,
+                    "tables_json",
+                    yaml_escape_value(json.dumps(tables, ensure_ascii=False)),
                 )
                 if changed:
                     with open(md_path, "w", encoding="utf-8") as f:
@@ -1526,7 +1526,7 @@ def process_paper(
 
                 if need_zh:
                     zh_title, zh_abstract = translate_title_and_abstract_to_zh(
-                        title, abstract_en
+                        title, abstract_en, client=paper_llm_client
                     )
                     updated = existing
 
@@ -1569,7 +1569,7 @@ def process_paper(
         # 已存在速览则默认不重复生成（避免重复 LLM 调用），除非 force_glance=true
         has_glance = "## 速览" in existing
         if force_glance or not has_glance:
-            glance = generate_glance_overview(title, abstract_en) or build_glance_fallback(paper)
+            glance = generate_glance_overview(title, abstract_en, client=paper_llm_client) or build_glance_fallback(paper)
             if glance:
                 paper["_glance_overview"] = glance
 
@@ -1628,7 +1628,7 @@ def process_paper(
             # 生成详细总结
             pdf_url = str(paper.get("link") or paper.get("pdf_url") or "").strip()
             ensure_text_content(pdf_url, txt_path)
-            summary = generate_deep_summary(md_path, txt_path)
+            summary = generate_deep_summary(md_path, txt_path, client=paper_llm_client)
             if summary:
                 upsert_auto_block(md_path, "论文详细总结（自动生成）", summary)
             return paper_id, title
@@ -1644,7 +1644,7 @@ def process_paper(
                 ensure_text_content(pdf_url, txt_path)
             except Exception:
                 pass
-        figures = maybe_generate_paper_figures(
+        figures, tables = maybe_generate_paper_media(
             paper,
             docs_dir=docs_dir,
             paper_id=paper_id,
@@ -1652,7 +1652,9 @@ def process_paper(
         )
         if figures:
             paper["_figure_assets"] = figures
-        glance = generate_glance_overview(title, abstract_en) or build_glance_fallback(paper)
+        if tables:
+            paper["_table_assets"] = tables
+        glance = generate_glance_overview(title, abstract_en, client=paper_llm_client) or build_glance_fallback(paper)
         if glance:
             paper["_glance_overview"] = glance
         tags_list = build_tags_list(section, paper.get("llm_tags") or [])
@@ -1665,7 +1667,7 @@ def process_paper(
     # 新文件：生成完整内容
     pdf_url = str(paper.get("link") or paper.get("pdf_url") or "").strip()
     ensure_text_content(pdf_url, txt_path)
-    figures = maybe_generate_paper_figures(
+    figures, tables = maybe_generate_paper_media(
         paper,
         docs_dir=docs_dir,
         paper_id=paper_id,
@@ -1673,10 +1675,12 @@ def process_paper(
     )
     if figures:
         paper["_figure_assets"] = figures
+    if tables:
+        paper["_table_assets"] = tables
 
-    zh_title, zh_abstract = translate_title_and_abstract_to_zh(title, abstract_en)
+    zh_title, zh_abstract = translate_title_and_abstract_to_zh(title, abstract_en, client=paper_llm_client)
     tags_list = build_tags_list(section, paper.get("llm_tags") or [])
-    glance = generate_glance_overview(title, abstract_en) or build_glance_fallback(paper)
+    glance = generate_glance_overview(title, abstract_en, client=paper_llm_client) or build_glance_fallback(paper)
     if glance:
         paper["_glance_overview"] = glance
     content = build_markdown_content(paper, section, zh_title, zh_abstract, tags_list)
@@ -1687,7 +1691,7 @@ def process_paper(
 
     # 精读区：生成详细总结
     if section == "deep":
-        summary = generate_deep_summary(md_path, txt_path)
+        summary = generate_deep_summary(md_path, txt_path, client=paper_llm_client)
         if summary:
             upsert_auto_block(md_path, "论文详细总结（自动生成）", summary)
     # 速读区：不生成额外的总结，只保留速览和摘要

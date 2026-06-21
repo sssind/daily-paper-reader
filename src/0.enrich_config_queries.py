@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # 自动补全 config.yaml 中的 related / rewrite 字段：
-# - keywords 缺少 related 时，调用 BLT gpt-4o-mini 生成相关词
-# - llm_queries 缺少 rewrite 时，调用 BLT gpt-4o-mini 生成英文改写
+# - keywords 缺少 related 时，调用 DeepSeek 生成相关词
+# - llm_queries 缺少 rewrite 时，调用 DeepSeek 生成英文改写
 
 import os
 import json
@@ -10,12 +10,18 @@ from typing import Any, Dict, List
 
 import yaml  # type: ignore
 
-from llm import BltClient
+from llm import DeepSeekClient
 
 SCRIPT_DIR = os.path.dirname(__file__)
 CONFIG_FILE = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "config.yaml"))
 
-MODEL_NAME = os.getenv("BLT_REWRITE_MODEL", "gemini-3-flash-preview")
+MODEL_NAME = (
+  os.getenv("DEEPSEEK_REWRITE_MODEL")
+  or os.getenv("SUMMARY_MODEL")
+  or os.getenv("DEEPSEEK_MODEL")
+  or "deepseek-v4-flash"
+)
+BASE_URL = os.getenv("DEEPSEEK_BASE_URL") or os.getenv("SUMMARY_BASE_URL") or "https://api.deepseek.com"
 
 def log(message: str) -> None:
   ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -106,21 +112,25 @@ def build_rewrite_prompt(query: str) -> List[Dict[str, str]]:
   ]
 
 
-def call_llm_json(client: BltClient, messages: List[Dict[str, str]], schema_name: str, schema: Dict[str, Any]) -> Dict[str, Any]:
-  response_format = {
-    "type": "json_schema",
-    "json_schema": {
-      "name": schema_name,
-      "schema": schema,
-      "strict": True,
-    },
-  }
-  resp = client.chat(messages, response_format=response_format)
-  content = resp.get("content", "")
-  try:
-    return json.loads(content)
-  except Exception:
-    raise ValueError(f"模型未返回合法 JSON：{content}")
+def call_llm_json(client: DeepSeekClient, messages: List[Dict[str, str]], schema_name: str, schema: Dict[str, Any]) -> Dict[str, Any]:
+  resp = client.chat_structured(
+    messages,
+    schema_name=schema_name,
+    schema=schema,
+    strict=True,
+    allow_json_object_fallback=True,
+  )
+  if resp.get("refusal"):
+    raise ValueError(f"模型拒绝输出结构化结果：{resp.get('refusal')}")
+  if resp.get("finish_reason") not in (None, "stop"):
+    raise ValueError(f"结构化输出未完成：finish_reason={resp.get('finish_reason')}")
+  if resp.get("parse_error") is not None:
+    raise ValueError(f"模型未返回合法 JSON：{resp.get('content')}")
+
+  parsed = resp.get("parsed")
+  if not isinstance(parsed, dict):
+    raise ValueError(f"模型未返回合法 JSON：{resp.get('content')}")
+  return parsed
 
 
 def main() -> None:
@@ -136,9 +146,9 @@ def main() -> None:
     if not os.path.exists(CONFIG_FILE):
         raise FileNotFoundError(f"找不到 config.yaml：{CONFIG_FILE}")
 
-    api_key = os.getenv("BLT_API_KEY")
+    api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("SUMMARY_API_KEY")
     if not api_key:
-        raise RuntimeError("缺少 BLT_API_KEY 环境变量，无法调用 BLT。")
+        raise RuntimeError("缺少 DEEPSEEK_API_KEY 或 SUMMARY_API_KEY 环境变量，无法调用 DeepSeek。")
 
     group_start("Step 0.0 - load config")
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -149,7 +159,7 @@ def main() -> None:
     keywords = subs.get("keywords") or []
     llm_queries = subs.get("llm_queries") or []
 
-    client = BltClient(api_key=api_key, model=MODEL_NAME)
+    client = DeepSeekClient(api_key=api_key, model=MODEL_NAME, base_url=BASE_URL)
 
     related_schema = {
       "type": "object",
